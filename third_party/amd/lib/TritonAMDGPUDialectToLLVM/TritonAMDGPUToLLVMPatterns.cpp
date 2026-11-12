@@ -13,5 +13,6 @@ void populateTritonAMDGPUToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        benefit);
   populateScaledDowncastOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                          benefit);
+  populatePinVGPROpToLLVMPatterns(typeConverter, patterns, benefit);
 }
 } // namespace mlir::triton::AMD

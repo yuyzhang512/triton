@@ -24,6 +24,10 @@ void populateScaledDowncastOpToLLVMPatterns(
     mlir::LLVMTypeConverter &typeConverter, mlir::RewritePatternSet &patterns,
     const AMD::TargetInfo &targetInfo, mlir::PatternBenefit benefit);
 
+void populatePinVGPROpToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
+                                     mlir::RewritePatternSet &patterns,
+                                     mlir::PatternBenefit benefit);
+
 } // namespace mlir::triton::AMD
 
 #endif // TRITON_THIRD_PARTY_AMD_INCLUDE_TRITONAMDGPUTOLLVM_PATTERNTRITONAMDGPUTOLLVM_H_

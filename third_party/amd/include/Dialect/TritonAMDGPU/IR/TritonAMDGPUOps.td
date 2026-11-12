@@ -1656,4 +1656,49 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
   let assemblyFormat = "attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// PinVGPROp
+//===----------------------------------------------------------------------===//
+
+def PinVGPROp : TT_AMDGPU_Op<"pin_vgpr", [AllTypesMatch<["src", "result"]>]> {
+  let summary = "Place a tensor's per-thread registers at fixed VGPRs";
+  let description = [{
+    Requests that each thread hold the elements of `src` in fixed VGPRs, in
+    register order, two 16-bit or one 32-bit element per VGPR. The elements
+    are grouped into requests of 8 VGPRs, the size of one gfx1250 WMMA operand
+    fragment or accumulator tile, and each group is lowered to a
+    `llvm.amdgcn.pin.vgpr` call. With one entry in `bases` the groups follow
+    each other from `bases[0]`; otherwise group i starts at `bases[i]`.
+
+    The op has no effect on the values. It has unknown side effects, so it is
+    neither hoisted nor merged with another pin: the request applies where it
+    is written.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$src, DenseI32ArrayAttr:$bases);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = "$src `,` $bases attr-dict `:` type($src)";
+}
+
+//===----------------------------------------------------------------------===//
+// PinLDSAddressOp
+//===----------------------------------------------------------------------===//
+
+def PinLDSAddressOp : TT_AMDGPU_Op<"pin_lds_address", [AllTypesMatch<["src", "result"]>]> {
+  let summary = "Place the LDS address registers of the loads producing a tensor";
+  let description = [{
+    `src` must come from a shared-memory load. Asks for the address registers
+    of the LDS loads producing it to be taken from VGPRs
+    [`first`, `first` + `count`). Loads whose addresses differ only by a
+    constant share one register; the backend splits them so each offset fits
+    the DS instruction's offset field. Returns `src` unchanged.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$src, I32Attr:$first, I32Attr:$count);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = "$src `,` $first `,` $count attr-dict `:` type($src)";
+}
+
 #endif

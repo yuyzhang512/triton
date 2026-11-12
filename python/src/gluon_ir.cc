@@ -1536,6 +1536,21 @@ void init_gluon_ir(py::module_ &m) {
            [](GluonOpBuilder &self) {
              self.create<ttag::ClusterBarrierWaitOp>();
            })
+      .def("create_amd_pin_vgpr",
+           [](GluonOpBuilder &self, Value src,
+              std::vector<int32_t> &bases) -> Value {
+             return self.create<ttag::PinVGPROp>(
+                 src.getType(), src,
+                 self.getBuilder().getDenseI32ArrayAttr(bases));
+           })
+      .def("create_amd_pin_lds_address",
+           [](GluonOpBuilder &self, Value src, int32_t first,
+              int32_t count) -> Value {
+             auto &b = self.getBuilder();
+             return self.create<ttag::PinLDSAddressOp>(
+                 src.getType(), src, b.getI32IntegerAttr(first),
+                 b.getI32IntegerAttr(count));
+           })
       .def("create_amd_sched_barrier",
            [](GluonOpBuilder &self, uint32_t mask) {
              auto schedMask = ROCDL::symbolizeSchedGroupMask(mask);
