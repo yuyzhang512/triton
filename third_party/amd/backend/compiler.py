@@ -339,6 +339,11 @@ def get_llvm_flags(options):
     # s_wait_alu va_vdst waits in expert scheduling mode.
     if options.arch == "gfx1250" and is_expert_scheduling_enabled(options.arch):
         flags.append("amdgpu-anti-hints-for-va-vdst")
+    # Skipping uniform regions in StructurizeCFG (llvm#206739) keeps loop-invariant
+    # LDS addresses live twice across a runtime-unrolled loop and its remainder,
+    # costing an occupancy step on gfx950 (ff_a16w16 gate gemm: 64 -> 72 VGPRs).
+    if options.arch == "gfx950":
+        flags.append("structurizecfg-skip-uniform-regions=0")
     # User-requested options come last so they override the defaults above.
     flags.extend(f"{name}={value}" for name, value in options.llvm_cl_opts)
     return flags
