@@ -66,6 +66,95 @@ void rewriteExp2WithFlushMode(ModuleOp module) {
   });
 }
 
+// [PlumbCompiler][lowering] Compares of indices against "T + c".
+//
+// Layout lowering gives each register of a tensor its index as T + c: T is
+// what the thread computes at run time and is the same for all its registers
+// (lane and warp part, plus scalars such as the loop's block start), and c is
+// the register's constant offset (emitIndices joins it with `or disjoint`
+// when the bits cannot overlap). A causal mask then compares the row against
+// T + c_i once per register. LLVM's LICM reassociates T + c_i and hoists the
+// loop-invariant part of T together with c_i: one live register per element
+// across the loop (aiter's causal MHA: 28 of them, 53 spills).
+//
+// Rewrite icmp(pred, L + cL, R + cR) to icmp(pred, L - R, cR - cL): one
+// subtraction, the same for every register and merged by CSE, compared
+// against immediates. Valid when the index arithmetic does not overflow,
+// which is Triton's contract for integer indices (sanitize_overflow checks
+// it); applied to equality and signed predicates only, and the subtraction
+// carries no nsw flag, so LICM does not reassociate it back.
+struct IndexSum {
+  SmallVector<Value> terms;
+  int64_t constant = 0;
+};
+
+void decomposeIndexSum(Value v, IndexSum &sum, int depth) {
+  APInt cst;
+  if (matchPattern(v, m_ConstantInt(&cst))) {
+    sum.constant += cst.getSExtValue();
+    return;
+  }
+  if (depth < 8) {
+    if (auto add = v.getDefiningOp<LLVM::AddOp>()) {
+      decomposeIndexSum(add.getLhs(), sum, depth + 1);
+      decomposeIndexSum(add.getRhs(), sum, depth + 1);
+      return;
+    }
+    if (auto orOp = v.getDefiningOp<LLVM::OrOp>(); orOp && orOp.getIsDisjoint()) {
+      decomposeIndexSum(orOp.getLhs(), sum, depth + 1);
+      decomposeIndexSum(orOp.getRhs(), sum, depth + 1);
+      return;
+    }
+  }
+  sum.terms.push_back(v);
+}
+
+void rewriteIndexCompares(ModuleOp module) {
+  SmallVector<LLVM::ICmpOp> cmps;
+  module.walk([&](LLVM::ICmpOp op) { cmps.push_back(op); });
+  for (LLVM::ICmpOp op : cmps) {
+    auto ty = dyn_cast<IntegerType>(op.getLhs().getType());
+    if (!ty || ty.getWidth() != 32)
+      continue;
+    switch (op.getPredicate()) {
+    case LLVM::ICmpPredicate::eq:
+    case LLVM::ICmpPredicate::ne:
+    case LLVM::ICmpPredicate::slt:
+    case LLVM::ICmpPredicate::sle:
+    case LLVM::ICmpPredicate::sgt:
+    case LLVM::ICmpPredicate::sge:
+      break;
+    default:
+      continue;
+    }
+    IndexSum lhs, rhs;
+    decomposeIndexSum(op.getLhs(), lhs, 0);
+    decomposeIndexSum(op.getRhs(), rhs, 0);
+    // Only a register's constant offset on a side that also has runtime
+    // terms; a compare against a plain constant is already in this form.
+    if (lhs.terms.empty() || rhs.terms.empty())
+      continue;
+    if (lhs.constant == 0 && rhs.constant == 0)
+      continue;
+    int64_t k = rhs.constant - lhs.constant;
+    if (k < INT32_MIN || k > INT32_MAX)
+      continue;
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    auto sumOf = [&](ArrayRef<Value> terms) {
+      Value s = terms.front();
+      for (Value t : terms.drop_front())
+        s = LLVM::AddOp::create(b, loc, s, t);
+      return s;
+    };
+    Value diff =
+        LLVM::SubOp::create(b, loc, sumOf(lhs.terms), sumOf(rhs.terms));
+    Value kv = LLVM::ConstantOp::create(b, loc, ty, b.getI32IntegerAttr(k));
+    op.getLhsMutable().assign(diff);
+    op.getRhsMutable().assign(kv);
+  }
+}
+
 // Replace `load <1 x T>` whose only users are `extractelement 0` with a scalar
 // `load T`. Lowerings emit `vector<vec x T>` loads even for vec = 1; the scalar
 // form is the same access. Volatile and atomic loads are left alone. The clone
@@ -762,6 +851,7 @@ public:
     if (setFP32DenormalMode)
       configureFP32DenormalMode(m, allowFlushDenorm);
     rewriteExp2WithFlushMode(m);
+    rewriteIndexCompares(m);
 
     // step 1: convert struct type to vector type
     mlir::TypeConverter converter;

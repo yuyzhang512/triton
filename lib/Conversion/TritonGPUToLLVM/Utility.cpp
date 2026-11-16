@@ -514,6 +514,24 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
 
   SmallVector<SmallVector<std::pair<StringAttr, Value>>> ret;
 
+  // [PlumbCompiler][layout] Per output dim, whether the bits the register
+  // bases can set are disjoint from the bits every other input dim (lane,
+  // warp, block) can set. Then base ^ c == base | c == base + c, and the
+  // register part is emitted as a disjoint or: later passes can then treat it
+  // as adding a constant (for example, compare against an immediate instead
+  // of keeping a per-register index live).
+  SmallVector<bool> regDisjoint(layout.getNumOutDims(), false);
+  {
+    SmallVector<int32_t> regBits(layout.getNumOutDims(), 0);
+    SmallVector<int32_t> otherBits(layout.getNumOutDims(), 0);
+    for (const auto &[inDim, inBases] : layout.getBases())
+      for (const auto &basis : inBases)
+        for (auto [d, v] : llvm::enumerate(basis))
+          (inDim == kRegister ? regBits : otherBits)[d] |= v;
+    for (unsigned d = 0; d < regDisjoint.size(); ++d)
+      regDisjoint[d] = (regBits[d] & otherBits[d]) == 0;
+  }
+
   // Iterate over registers, applying XOR trick
   for (auto reg : registers) {
     SmallVector<std::pair<StringAttr, int32_t>> constRegIndices;
@@ -523,9 +541,16 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
     auto regIndices = layout.apply(constRegIndices);
 
     SmallVector<std::pair<StringAttr, Value>> combinedIndices;
-    for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
+    for (auto [d, pair] : llvm::enumerate(llvm::zip(baseIndices, regIndices))) {
+      auto [base, regIdx] = pair;
       assert(base.first == regIdx.first);
-      Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
+      Value combined;
+      if (regDisjoint[d])
+        combined = LLVM::OrOp::create(rewriter, loc, base.second,
+                                      b.i32_val(regIdx.second),
+                                      /*isDisjoint=*/rewriter.getUnitAttr());
+      else
+        combined = b.xor_(base.second, b.i32_val(regIdx.second));
       combinedIndices.emplace_back(base.first, combined);
     }
 
