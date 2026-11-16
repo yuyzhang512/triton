@@ -13,6 +13,10 @@
 
 #include "TritonLLVMTransforms/Passes.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/MathExtras.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include <numeric>
 
 #define DEBUG_TYPE "tritonllvm-vectorize"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -153,6 +157,214 @@ void rewriteIndexCompares(ModuleOp module) {
     op.getLhsMutable().assign(diff);
     op.getRhsMutable().assign(kv);
   }
+}
+
+// [PlumbCompiler][lowering] Carry a block argument at the width its users slice.
+//
+// Step 1 turns a whole per-thread tensor into one vector. A GEMM accumulator
+// (64 floats per thread here) then becomes one vector<64xf32> loop argument:
+// each MFMA cuts its 4-float tile out of it and the loop rebuilds the 64-wide
+// value for the next iteration. The register allocator cannot keep the tiles in
+// place inside that 64-register tuple: on gfx950's v9 GEMM it moves accumulators
+// between AGPRs 352 times after the loop.
+//
+// When every use of a vector block argument is an aligned slice (shufflevector
+// of a contiguous range) that feeds an MFMA accumulator, carry it as pieces of
+// the slices' common width (the MFMA tile) instead: predecessors pass slices of
+// their value, and each slice use reads its piece. Arguments used otherwise
+// (as a whole vector, as in FA's accumulator rescale, or as MFMA A/B operands)
+// are left as they are.
+bool isAlignedSlice(Operation *user, Value v, int64_t &start, int64_t &width) {
+  auto sv = dyn_cast<LLVM::ShuffleVectorOp>(user);
+  if (!sv || sv.getV1() != v)
+    return false;
+  int64_t n = cast<VectorType>(v.getType()).getNumElements();
+  ArrayRef<int32_t> mask = sv.getMask();
+  if (mask.empty() || mask.front() < 0)
+    return false;
+  start = mask.front();
+  for (auto [i, m] : llvm::enumerate(mask))
+    if (m != start + static_cast<int64_t>(i) || m >= n)
+      return false;
+  width = mask.size();
+  return true;
+}
+
+// Whether every use of v is an MFMA's accumulator operand (operand 2 of the
+// rocdl.mfma* ops), directly or through a one-operand inline asm that ties the
+// value to a register class (Gluon's cd_regclass: "=a,0" / "=v,0").
+bool feedsOnlyMFMAAccumulators(Value v, int depth = 0) {
+  if (v.use_empty())
+    return false;
+  for (OpOperand &use : v.getUses()) {
+    Operation *user = use.getOwner();
+    if (user->getName().getStringRef().starts_with("rocdl.mfma") &&
+        use.getOperandNumber() == 2)
+      continue;
+    if (auto asmOp = dyn_cast<LLVM::InlineAsmOp>(user);
+        asmOp && depth == 0 && asmOp->getNumOperands() == 1 &&
+        asmOp->getNumResults() == 1 &&
+        feedsOnlyMFMAAccumulators(asmOp->getResult(0), depth + 1))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+Value concatPieces(OpBuilder &b, Location loc, ArrayRef<Value> pieces) {
+  SmallVector<Value> level(pieces);
+  while (level.size() > 1) {
+    SmallVector<Value> next;
+    for (size_t i = 0; i + 1 < level.size(); i += 2) {
+      int64_t w = cast<VectorType>(level[i].getType()).getNumElements();
+      SmallVector<int32_t> mask(2 * w);
+      std::iota(mask.begin(), mask.end(), 0);
+      next.push_back(
+          LLVM::ShuffleVectorOp::create(b, loc, level[i], level[i + 1], mask));
+    }
+    level = std::move(next);
+  }
+  return level.front();
+}
+
+bool splitSlicedBlockArgument(BlockArgument arg) {
+  auto vecTy = dyn_cast<VectorType>(arg.getType());
+  if (!vecTy || vecTy.getRank() != 1)
+    return false;
+  int64_t n = vecTy.getNumElements();
+  Block *block = arg.getOwner();
+  if (block->isEntryBlock())
+    return false;
+  // Every use must be an aligned slice; the piece width is their gcd.
+  int64_t w = n;
+  SmallVector<std::tuple<LLVM::ShuffleVectorOp, int64_t, int64_t>> slices;
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  for (OpOperand &use : arg.getUses()) {
+    int64_t start, width;
+    if (!isAlignedSlice(use.getOwner(), arg, start, width))
+      return false;
+    // A slice may use the argument as both shuffle operands.
+    if (!seen.insert(use.getOwner()).second)
+      continue;
+    // Only accumulators: the pieces are the MFMA tiles.
+    if (!feedsOnlyMFMAAccumulators(use.getOwner()->getResult(0)))
+      return false;
+    w = std::gcd(w, std::gcd(start, width));
+    slices.emplace_back(cast<LLVM::ShuffleVectorOp>(use.getOwner()), start,
+                        width);
+  }
+  if (slices.empty() || w == n || n % w)
+    return false;
+  int64_t k = n / w;
+  for (auto [sv, start, width] : slices)
+    if (!llvm::isPowerOf2_64(width / w))
+      return false;
+  // Every predecessor must branch here through a BranchOpInterface.
+  for (Block *pred : block->getPredecessors())
+    if (!isa<BranchOpInterface>(pred->getTerminator()))
+      return false;
+
+  auto pieceTy = VectorType::get({w}, vecTy.getElementType());
+  unsigned argIdx = arg.getArgNumber();
+  SmallVector<Value> pieces;
+  for (int64_t i = 0; i < k; ++i)
+    pieces.push_back(block->addArgument(pieceTy, arg.getLoc()));
+
+  // Predecessors: pass slices of the incoming value, then drop the old operand.
+  for (Block *pred : llvm::to_vector(block->getPredecessors())) {
+    auto br = cast<BranchOpInterface>(pred->getTerminator());
+    for (unsigned s = 0; s < br->getNumSuccessors(); ++s) {
+      if (br->getSuccessor(s) != block)
+        continue;
+      SuccessorOperands ops = br.getSuccessorOperands(s);
+      Value in = ops[argIdx];
+      OpBuilder b(br);
+      SmallVector<Value> inPieces;
+      for (int64_t i = 0; i < k; ++i) {
+        SmallVector<int32_t> mask(w);
+        std::iota(mask.begin(), mask.end(), static_cast<int32_t>(i * w));
+        inPieces.push_back(
+            LLVM::ShuffleVectorOp::create(b, br.getLoc(), in, in, mask));
+      }
+      ops.append(inPieces);
+      ops.erase(argIdx);
+    }
+  }
+  // Uses: each slice reads its pieces.
+  for (auto [sv, start, width] : slices) {
+    OpBuilder b(sv);
+    ArrayRef<Value> mine = ArrayRef<Value>(pieces).slice(start / w, width / w);
+    sv.getResult().replaceAllUsesWith(concatPieces(b, sv.getLoc(), mine));
+    sv.erase();
+  }
+  block->eraseArgument(argIdx);
+  return true;
+}
+
+// A slice of a concatenation is the matching part of one of its operands:
+// shufflevector(shufflevector(A, B, [0 .. 2w)), [s .. s+k)) with the range
+// inside A or inside B. Fold it, so no wide value is rebuilt only to be cut
+// again (LLVM folds these only partly, and loop rotation keeps the rest).
+bool foldSliceOfConcat(LLVM::ShuffleVectorOp sv) {
+  int64_t start, width;
+  if (!isAlignedSlice(sv, sv.getV1(), start, width))
+    return false;
+  auto concat = sv.getV1().getDefiningOp<LLVM::ShuffleVectorOp>();
+  if (!concat || concat.getV1().getType() != concat.getV2().getType())
+    return false;
+  int64_t w = cast<VectorType>(concat.getV1().getType()).getNumElements();
+  ArrayRef<int32_t> mask = concat.getMask();
+  if (static_cast<int64_t>(mask.size()) != 2 * w)
+    return false;
+  for (auto [i, m] : llvm::enumerate(mask))
+    if (m != static_cast<int32_t>(i))
+      return false;
+  Value src;
+  if (start + width <= w)
+    src = concat.getV1();
+  else if (start >= w) {
+    src = concat.getV2();
+    start -= w;
+  } else
+    return false;
+  OpBuilder b(sv);
+  Value repl = src;
+  if (width != w) {
+    SmallVector<int32_t> m(width);
+    std::iota(m.begin(), m.end(), static_cast<int32_t>(start));
+    repl = LLVM::ShuffleVectorOp::create(b, sv.getLoc(), src, src, m);
+  }
+  sv.getResult().replaceAllUsesWith(repl);
+  sv.erase();
+  return true;
+}
+
+void foldSlicesOfConcats(ModuleOp module) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<LLVM::ShuffleVectorOp> svs;
+    module.walk([&](LLVM::ShuffleVectorOp op) { svs.push_back(op); });
+    for (auto op : svs)
+      changed |= foldSliceOfConcat(op);
+  }
+}
+
+bool splitSlicedBlockArguments(ModuleOp module) {
+  bool any = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    module.walk([&](Block *block) -> WalkResult {
+      for (BlockArgument arg : llvm::to_vector(block->getArguments()))
+        if (splitSlicedBlockArgument(arg)) {
+          changed = any = true;
+          return WalkResult::interrupt();
+        }
+      return WalkResult::advance();
+    });
+  }
+  return any;
 }
 
 // Replace `load <1 x T>` whose only users are `extractelement 0` with a scalar
@@ -914,7 +1126,17 @@ public:
     pm.addPass(mlir::createCSEPass());
     if (failed(runPipeline(pm, m)))
       return signalPassFailure();
-    // step 4: print constant human readable
+    // step 4: carry sliced block arguments as pieces of their slice width.
+    // After canonicalization, which has turned the element-wise extract/insert
+    // chains into the shufflevector slices this step looks for.
+    // Fold only when tiles were split, so other kernels are left as they were.
+    if (splitSlicedBlockArguments(m))
+      foldSlicesOfConcats(m);
+    OpPassManager pm2;
+    pm2.addPass(mlir::createCanonicalizerPass());
+    pm2.addPass(mlir::createCSEPass());
+    if (failed(runPipeline(pm2, m)))
+      return signalPassFailure();
   }
 };
 } // namespace mlir
