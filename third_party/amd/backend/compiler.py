@@ -681,6 +681,16 @@ class HIPBackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        # [PlumbCompiler] Register planning on the final TTGIR (scf.for still
+        # structured). PLUMB_RA="mode[,pressure=N,max-regs=N,agpr-base=N,report]",
+        # mode = report | homes | auto; off when unset.
+        plumb_ra = metadata.pop("_plumb_ra_override", None) or os.environ.get("PLUMB_RA")
+        if plumb_ra and not plumb_ra.startswith("auto"):
+            ra_mode, *ra_kv = plumb_ra.split(",")
+            ra = dict(kv.split("=", 1) if "=" in kv else (kv, "1") for kv in ra_kv)
+            amd.passes.ttgpuir.add_plumb_register_plan(pm, ra_mode, int(ra.get("pressure", 512)),
+                                                       int(ra.get("max-regs", 32)),
+                                                       int(ra.get("agpr-base", 0)), "report" in ra)
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
@@ -886,6 +896,50 @@ class HIPBackend(BaseBackend):
         amd.disable_print_inline(llvm_mod)
         return str(llvm_mod)
 
+    # [PlumbCompiler] PLUMB_RA=auto: whether AGPR homes pay depends on whether the
+    # kernel runs out of registers, which only the backend sees (the TTGIR of two
+    # MoE shapes can be identical while only one spills). Lower and compile
+    # normally; if the assembly spills, lower again with homes placed and keep the
+    # variant that spills less. The compiled assembly is cached by LLIR hash so
+    # make_amdgcn does not compile the chosen variant twice.
+    _plumb_amdgcn_cache = {}
+
+    @staticmethod
+    def _spills(amdgcn):
+        m = re.search(r"\.vgpr_spill_count:\s+(\d+)", amdgcn)
+        return int(m.group(1)) if m else 0
+
+    def make_llir_plumb_auto(self, src, metadata, options):
+        ttgir = str(src)
+        ctx = src.context
+        llir0 = self.make_llir(src, metadata, options)
+        asm0 = self.make_amdgcn(llir0, dict(metadata), options)
+        spills0 = self._spills(asm0)
+        decision = {"spills_without": spills0, "placed": False}
+        if spills0 > 0:
+            extra = os.environ.get("PLUMB_RA", "auto").split(",")[1:]
+            with tempfile.NamedTemporaryFile("w", suffix=".ttgir", delete=False) as f:
+                f.write(ttgir)
+            try:
+                mod1 = ir.parse_mlir_module(f.name, ctx)
+                mod1.context = ctx
+                meta1 = dict(metadata)
+                meta1["_plumb_ra_override"] = ",".join(["homes"] + extra)
+                llir1 = self.make_llir(mod1, meta1, options)
+                asm1 = self.make_amdgcn(llir1, dict(metadata), options)
+                spills1 = self._spills(asm1)
+                decision["spills_with"] = spills1
+                if spills1 < spills0:
+                    decision["placed"] = True
+                    for k, v in meta1.items():
+                        metadata.setdefault(k, v)
+                    metadata["plumb_ra"] = decision
+                    return llir1
+            finally:
+                os.unlink(f.name)
+        metadata["plumb_ra"] = decision
+        return llir0
+
     @staticmethod
     def make_amdgcn(src, metadata, options):
         # Find kernel names (there should only be one)
@@ -894,6 +948,10 @@ class HIPBackend(BaseBackend):
         names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", src)
         assert len(names) == 1
         metadata["name"] = names[0]
+        plumb_key = hashlib.sha256(src.encode("utf-8")).hexdigest() if os.environ.get(
+            "PLUMB_RA", "").startswith("auto") else None
+        if plumb_key and plumb_key in HIPBackend._plumb_amdgcn_cache:
+            return HIPBackend._plumb_amdgcn_cache.pop(plumb_key)
         # llvm -> hsaco
         flags = get_llvm_flags(options)
         features = ''
@@ -938,6 +996,8 @@ class HIPBackend(BaseBackend):
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
+        if plumb_key:
+            HIPBackend._plumb_amdgcn_cache[plumb_key] = amdgcn
         return amdgcn
 
     @staticmethod
@@ -962,7 +1022,10 @@ class HIPBackend(BaseBackend):
         elif language == Language.GLUON:
             stages["glir"] = lambda src, metadata: src
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options)
-        stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
+        if os.environ.get("PLUMB_RA", "").startswith("auto"):
+            stages["llir"] = lambda src, metadata: self.make_llir_plumb_auto(src, metadata, options)
+        else:
+            stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
         if knobs.runtime.add_stages_inspection_hook is not None:

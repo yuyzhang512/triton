@@ -24,6 +24,7 @@ add_triton_library(TritonAMDGPUTransforms
   WmmaGroup.cpp
   InThreadTranspose.cpp
   FoldTrueCmpIOp.cpp
+  PlumbRegisterPlan.cpp
   FpSanitizer.cpp
   UpdateAsyncWaitCount.cpp
   Utility.cpp

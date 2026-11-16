@@ -120,6 +120,17 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
                           mlir::createTritonAMDGPUOptimizeBufferOpPtr);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
+  m.def("add_plumb_register_plan",
+        [](mlir::PassManager &pm, const std::string &mode, int64_t pressure,
+           int64_t maxRegs, int64_t agprBase, bool report) {
+          mlir::TritonAMDGPUPlumbRegisterPlanOptions opts;
+          opts.mode = mode;
+          opts.pressure = pressure;
+          opts.maxRegs = maxRegs;
+          opts.agprBase = agprBase;
+          opts.report = report;
+          pm.addPass(mlir::createTritonAMDGPUPlumbRegisterPlan(opts));
+        });
   ADD_PASS_WRAPPER_0("add_fp_sanitizer", mlir::createTritonAMDGPUFpSanitizer);
 
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",

@@ -389,3 +389,31 @@ def TritonAMDGPUFpSanitizer : Pass<"tritonamdgpu-fp-sanitizer", "mlir::ModuleOp"
 }
 
 #endif
+
+def TritonAMDGPUPlumbRegisterPlan : Pass<"tritonamdgpu-plumb-register-plan", "mlir::ModuleOp"> {
+  let summary = "[PlumbCompiler] Give each loop-carried MFMA operand one AGPR home";
+
+  let description = [{
+    For the main loops (scf.for with dots), a tensor carried around the loop
+    as an MFMA operand (#ttg.dot_op) is pinned to the same AGPRs as its
+    initial value, block argument, yielded value and loop result
+    (amdg.pin_vgpr {agpr}), so the loop exit and the peeled drain need no
+    copies. mode=report only reports; homes always places; auto places when
+    the loop body's peak live tensor registers per thread reach `pressure`.
+  }];
+
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+
+  let options = [
+    Option<"mode", "mode", "std::string", /*default=*/"\"report\"",
+           "report | homes | auto">,
+    Option<"pressure", "pressure", "int64_t", /*default=*/"512",
+           "auto: place homes when the peak live tensor registers reach this">,
+    Option<"maxRegs", "max-regs", "int64_t", /*default=*/"32",
+           "largest object (registers per thread) to place">,
+    Option<"agprBase", "agpr-base", "int64_t", /*default=*/"0",
+           "first AGPR for the homes">,
+    Option<"report", "report", "bool", /*default=*/"false",
+           "emit a remark per loop with the facts and the decision">,
+  ];
+}
