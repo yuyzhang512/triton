@@ -4,12 +4,12 @@ from . import cdna3, cdna4, cdna5
 from . import rdna3, rdna4
 from . import gfx1250
 from . import hint
-from .pin import pin_vgpr, pin_lds_address
+from .pin import pin_vgpr, pin_lds_address, ra_hint
 from .slice import slice
 from .warp_pipeline import warp_pipeline_stage
 from .sync import s_barrier, local_barrier, wave_any
 
 __all__ = [
     "AMDMFMALayout", "AMDWMMALayout", "cdna3", "cdna4", "cdna5", "rdna3", "rdna4", "gfx1250", "warp_pipeline_stage",
-    "slice", "hint", "s_barrier", "local_barrier", "wave_any", "pin_vgpr", "pin_lds_address"
+    "slice", "hint", "s_barrier", "local_barrier", "wave_any", "pin_vgpr", "pin_lds_address", "ra_hint"
 ]

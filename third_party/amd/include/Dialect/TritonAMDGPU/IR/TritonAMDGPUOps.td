@@ -1673,12 +1673,50 @@ def PinVGPROp : TT_AMDGPU_Op<"pin_vgpr", [AllTypesMatch<["src", "result"]>]> {
     The op has no effect on the values. It has unknown side effects, so it is
     neither hoisted nor merged with another pin: the request applies where it
     is written.
+
+    With the `agpr` attribute the registers are AGPRs (gfx90a and later,
+    `llvm.amdgcn.pin.agpr`); `bases` are then AGPR numbers. 8-bit elements
+    are packed four to a register.
   }];
 
-  let arguments = (ins AnyRankedTensor:$src, DenseI32ArrayAttr:$bases);
+  let arguments = (ins AnyRankedTensor:$src, DenseI32ArrayAttr:$bases,
+                       UnitAttr:$agpr);
   let results = (outs AnyRankedTensor:$result);
 
   let assemblyFormat = "$src `,` $bases attr-dict `:` type($src)";
+}
+
+//===----------------------------------------------------------------------===//
+// RAHintOp
+//===----------------------------------------------------------------------===//
+
+def RAHintOp : TT_AMDGPU_Op<"ra_hint", [AllTypesMatch<["src", "result"]>]> {
+  let summary = "Tell the register allocator what a tensor's registers are for";
+  let description = [{
+    Returns `src` unchanged and passes facts about its per-thread registers to
+    the backend's partial VGPR allocation (gfx1250), which places them; nothing
+    is placed by this op itself. The registers are taken in groups of 8 VGPRs
+    in register order, as for `pin_vgpr`.
+
+    - `windows`: the 256-VGPR window (MSB group, 0-3) each group should be in;
+      one entry applies to all groups, -1 means no preference.
+    - `group`: tensors with the same non-zero group should share a window.
+    - `priority`: weight of this tensor's window conflicts, in percent of the
+      default (100).
+    - `guard`: do not reuse its registers within this many instructions after
+      their last read (0: the backend's default).
+
+    Lowered to one `llvm.amdgcn.ra.hint` per group, an identity the backend
+    reads after scheduling.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$src, DenseI32ArrayAttr:$windows,
+                       I32Attr:$group, I32Attr:$priority, I32Attr:$guard);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $src `,` $windows `,` $group `,` $priority `,` $guard attr-dict `:` type($src)
+  }];
 }
 
 //===----------------------------------------------------------------------===//

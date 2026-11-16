@@ -1541,7 +1541,17 @@ void init_gluon_ir(py::module_ &m) {
               std::vector<int32_t> &bases) -> Value {
              return self.create<ttag::PinVGPROp>(
                  src.getType(), src,
-                 self.getBuilder().getDenseI32ArrayAttr(bases));
+                 self.getBuilder().getDenseI32ArrayAttr(bases),
+                 /*agpr=*/UnitAttr());
+           })
+      .def("create_amd_ra_hint",
+           [](GluonOpBuilder &self, Value src, std::vector<int32_t> &windows,
+              int32_t group, int32_t priority, int32_t guard) -> Value {
+             auto &b = self.getBuilder();
+             return self.create<ttag::RAHintOp>(
+                 src.getType(), src, b.getDenseI32ArrayAttr(windows),
+                 b.getI32IntegerAttr(group), b.getI32IntegerAttr(priority),
+                 b.getI32IntegerAttr(guard));
            })
       .def("create_amd_pin_lds_address",
            [](GluonOpBuilder &self, Value src, int32_t first,

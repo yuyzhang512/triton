@@ -1,6 +1,6 @@
 from .._core import builtin, tensor, _unwrap_if_constexpr
 
-__all__ = ["pin_vgpr", "pin_lds_address"]
+__all__ = ["pin_vgpr", "pin_lds_address", "ra_hint"]
 
 
 @builtin
@@ -45,4 +45,32 @@ def pin_lds_address(x, first, count, _semantic=None):
     if not isinstance(first, int) or first < 0 or not isinstance(count, int) or count <= 0:
         raise ValueError(f"first and count must be non-negative ints, got {first!r}, {count!r}")
     handle = _semantic.builder.create_amd_pin_lds_address(x.handle, first, count)
+    return tensor(handle, x.type)
+
+
+@builtin
+def ra_hint(x, window=-1, group=0, priority=100, guard=0, _semantic=None):
+    """Tell the backend's register allocation what `x`'s registers are for.
+
+    Unlike `pin_vgpr`, nothing is placed here: the backend (gfx1250 partial
+    VGPR allocation, after scheduling) uses these facts together with the
+    exact schedule. The registers are taken in groups of 8 VGPRs.
+
+    Args:
+        x (tensor): The tensor.
+        window (int or list[int]): The 256-VGPR window (0-3) for all groups, or
+            one per group; -1 for no preference.
+        group (int): Tensors with the same non-zero group share a window.
+        priority (int): Weight of this tensor's conflicts, percent (100 = default).
+        guard (int): Instructions to wait before reusing its registers after
+            their last read (0 = backend default).
+    """
+    window = _unwrap_if_constexpr(window)
+    windows = [_unwrap_if_constexpr(w) for w in window] if isinstance(window, (list, tuple)) else [window]
+    if not windows or any(not isinstance(w, int) or w < -1 or w > 3 for w in windows):
+        raise ValueError(f"window must be -1..3 or a list of them, got {window!r}")
+    args = [_unwrap_if_constexpr(a) for a in (group, priority, guard)]
+    if any(not isinstance(a, int) or a < 0 for a in args):
+        raise ValueError(f"group, priority and guard must be non-negative ints, got {args!r}")
+    handle = _semantic.builder.create_amd_ra_hint(x.handle, windows, *args)
     return tensor(handle, x.type)
